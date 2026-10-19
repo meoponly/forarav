@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Telegram Lecture Forwarder Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen py-10 px-4">
+  <div class="max-w-4xl mx-auto space-y-6">
+
+    <!-- Header -->
+    <div class="flex items-center justify-between border-b border-slate-800 pb-5">
+      <div>
+        <h1 class="text-2xl font-bold tracking-tight text-white">Lecture Forwarder Control Hub</h1>
+        <p class="text-sm text-slate-400">Chronological message and video transfer between channels, groups, and supergroup topics.</p>
+      </div>
+      <div id="statusBadge" class="px-3 py-1 text-xs font-semibold rounded-full bg-slate-800 text-slate-300">
+        Status: Idle
+      </div>
+    </div>
+
+    <!-- Main Configuration Form -->
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-6 bg-slate-900 border border-slate-800 p-6 rounded-2xl shadow-xl">
+      
+      <!-- Source Panel -->
+      <div class="space-y-4">
+        <h2 class="text-base font-semibold text-sky-400">1. Source Configuration</h2>
+        <div>
+          <label class="block text-xs font-medium text-slate-300 mb-1">Source Chat / Channel</label>
+          <input type="text" id="source" placeholder="e.g. khaomaakasam or -100xxxxxxxx" 
+            class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-sky-500">
+          <p class="text-[11px] text-slate-500 mt-1">Username, t.me link, or raw chat ID.</p>
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-slate-300 mb-1">Source Topic / Thread ID (Optional)</label>
+          <input type="number" id="source_topic" placeholder="Leave empty if not a topic" 
+            class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-sky-500">
+          <p class="text-[11px] text-slate-500 mt-1">Found in the topic message link (e.g. t.me/c/xxx/&lt;topic_id&gt;).</p>
+        </div>
+      </div>
+
+      <!-- Target Panel -->
+      <div class="space-y-4">
+        <h2 class="text-base font-semibold text-emerald-400">2. Destination Configuration</h2>
+        <div>
+          <label class="block text-xs font-medium text-slate-300 mb-1">Target Chat / Channel</label>
+          <input type="text" id="target" placeholder="e.g. dkdkslodd or -100xxxxxxxx" 
+            class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+          <p class="text-[11px] text-slate-500 mt-1">Ensure your account has admin/posting permissions.</p>
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-slate-300 mb-1">Target Topic / Thread ID (Optional)</label>
+          <input type="number" id="target_topic" placeholder="Leave empty for main chat" 
+            class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+        </div>
+      </div>
+
+      <!-- Advanced Filters & Options -->
+      <div class="md:col-span-2 pt-2 border-t border-slate-800 grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div>
+          <label class="block text-xs font-medium text-slate-300 mb-1">Keyword Filter (Optional)</label>
+          <input type="text" id="filter_keyword" placeholder="e.g. Lecture or Physics" 
+            class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-sky-500">
+        </div>
+        <div class="flex items-center pt-5">
+          <label class="relative flex items-center cursor-pointer select-none">
+            <input type="checkbox" id="clean_copy" checked class="sr-only peer">
+            <div class="w-10 h-6 bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-sky-500"></div>
+            <span class="ml-3 text-sm font-medium text-slate-300">Clean copy (Hide "Forwarded from" tag)</span>
+          </label>
+        </div>
+      </div>
+
+      <!-- Action Buttons -->
+      <div class="md:col-span-2 flex items-center justify-end space-x-3 pt-2">
+        <button id="stopBtn" onclick="stopJob()" disabled 
+          class="px-5 py-2.5 rounded-lg text-sm font-semibold bg-rose-600/20 text-rose-300 border border-rose-500/30 hover:bg-rose-600/30 disabled:opacity-40 disabled:cursor-not-allowed">
+          Stop Process
+        </button>
+        <button id="startBtn" onclick="startJob()" 
+          class="px-6 py-2.5 rounded-lg text-sm font-semibold bg-sky-500 hover:bg-sky-400 text-slate-950 font-bold transition disabled:opacity-40 disabled:cursor-not-allowed">
+          Start Forwarding
+        </button>
+      </div>
+    </div>
+
+    <!-- Real-time Progress & Console Log -->
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
+      <div class="flex items-center justify-between">
+        <h3 class="text-sm font-semibold text-slate-300">Live Execution Log</h3>
+        <span id="counter" class="text-xs font-mono text-sky-400 font-bold">Processed: 0 messages</span>
+      </div>
+      <div id="console" class="h-64 overflow-y-auto bg-slate-950 rounded-xl p-4 font-mono text-xs text-slate-300 space-y-1 border border-slate-800">
+        <div class="text-slate-600">Waiting to start...</div>
+      </div>
+    </div>
+
+  </div>
+
+  <script>
+    async function startJob() {
+      const payload = {
+        source: document.getElementById('source').value,
+        source_topic: document.getElementById('source_topic').value,
+        target: document.getElementById('target').value,
+        target_topic: document.getElementById('target_topic').value,
+        clean_copy: document.getElementById('clean_copy').checked,
+        filter_keyword: document.getElementById('filter_keyword').value
+      };
+
+      try {
+        const res = await fetch('/api/start', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (data.error) alert(data.error);
+      } catch (err) {
+        alert("Failed to start job: " + err);
+      }
+    }
+
+    async function stopJob() {
+      await fetch('/api/stop', { method: 'POST' });
+    }
+
+    async function pollStatus() {
+      try {
+        const res = await fetch('/api/status');
+        const data = await res.json();
+
+        // Update badge and buttons
+        const badge = document.getElementById('statusBadge');
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+
+        if (data.is_running) {
+          badge.className = "px-3 py-1 text-xs font-semibold rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30";
+          badge.innerText = "Status: Running";
+          startBtn.disabled = true;
+          stopBtn.disabled = false;
+        } else {
+          badge.className = "px-3 py-1 text-xs font-semibold rounded-full bg-slate-800 text-slate-300";
+          badge.innerText = `Status: ${data.current_status}`;
+          startBtn.disabled = false;
+          stopBtn.disabled = true;
+        }
+
+        document.getElementById('counter').innerText = `Processed: ${data.total_processed} messages`;
+
+        // Update logs
+        const consoleEl = document.getElementById('console');
+        if (data.logs.length > 0) {
+          consoleEl.innerHTML = data.logs.map(l => `<div>&gt; ${l}</div>`).join('');
+          consoleEl.scrollTop = consoleEl.scrollHeight;
+        }
+      } catch (e) {
+        console.error("Poll error:", e);
+      }
+    }
+
+    setInterval(pollStatus, 2000);
+    pollStatus();
+  </script>
+</body>
+</html>
