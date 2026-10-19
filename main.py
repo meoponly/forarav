@@ -67,7 +67,6 @@ def parse_telegram_input(chat_input: str) -> Tuple[object, Optional[int]]:
         parts = raw.split("/")
         if len(parts) >= 2:
             if parts[0] == "c":
-                # Private supergroup link format: c/<channel_id>/<topic_id>
                 chat_id_part = parts[1]
                 topic_part = parts[2] if len(parts) > 2 else parts[1]
                 if chat_id_part.isdigit():
@@ -75,7 +74,6 @@ def parse_telegram_input(chat_input: str) -> Tuple[object, Optional[int]]:
                 if topic_part.isdigit():
                     topic_id = int(topic_part)
             else:
-                # Public topic link: <username>/<topic_id>
                 raw = parts[0]
                 if parts[1].isdigit():
                     topic_id = int(parts[1])
@@ -88,7 +86,6 @@ def parse_telegram_input(chat_input: str) -> Tuple[object, Optional[int]]:
 
 async def ensure_joined(identifier: object):
     """Auto-joins channel/group if not already a member."""
-    # Handle private invites (+hash)
     if isinstance(identifier, str) and identifier.startswith("+"):
         invite_hash = identifier[1:]
         try:
@@ -189,7 +186,7 @@ async def forward_item(source, target, message, clean_copy: bool, target_topic: 
             log(f"[Skip] Error copying message #{message.id}: {str(e)}")
             break
 
-async def run_forward_task(source_raw: str, target_raw: str, clean_copy: bool):
+async def run_forward_task(source_raw: str, target_raw: str, clean_copy: bool, min_msg_id: Optional[int], max_msg_id: Optional[int]):
     global state, client
     state["is_running"] = True
     state["current_status"] = "Running"
@@ -205,10 +202,28 @@ async def run_forward_task(source_raw: str, target_raw: str, clean_copy: bool):
         source = await ensure_joined(source_id)
         target = await ensure_joined(target_id)
 
-        log("Starting transfer in chronological order...")
+        # Telethon min_id is exclusive (min_id=X fetches > X). Subtract 1 if provided to include X.
+        actual_min_id = (min_msg_id - 1) if (min_msg_id and min_msg_id > 0) else None
+        # Telethon max_id is exclusive (max_id=Y fetches < Y). Add 1 if provided to include Y.
+        actual_max_id = (max_msg_id + 1) if max_msg_id else None
+
+        range_desc = []
+        if min_msg_id:
+            range_desc.append(f"from #{min_msg_id}")
+        if max_msg_id:
+            range_desc.append(f"to #{max_msg_id}")
+        range_str = f" ({', '.join(range_desc)})" if range_desc else " (Full History)"
+
+        log(f"Starting chronological transfer{range_str}...")
 
         # reverse=True ensures oldest to newest
-        async for message in client.iter_messages(source, reverse=True, reply_to=source_topic if source_topic else None):
+        async for message in client.iter_messages(
+            source, 
+            reverse=True, 
+            reply_to=source_topic if source_topic else None,
+            min_id=actual_min_id or 0,
+            max_id=actual_max_id or 0
+        ):
             if not state["is_running"]:
                 log("Stopped by user.")
                 break
@@ -254,7 +269,21 @@ HTML_CONTENT = """<!DOCTYPE html>
           <label class="block text-xs font-semibold uppercase tracking-wider text-sky-400 mb-1.5">From (Source)</label>
           <input type="text" id="source" placeholder="e.g. https://t.me/mygroup/41 or @channel" 
             class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3.5 py-2.5 text-sm focus:outline-none focus:border-sky-500 font-mono">
-          <p class="text-[11px] text-slate-500 mt-1">Accepts channel link, invite link, or topic link (e.g. <code>@group/41</code>).</p>
+          
+          <!-- Optional Message Range (From / To) -->
+          <div class="grid grid-cols-2 gap-3 mt-2.5">
+            <div>
+              <label class="block text-[11px] font-medium text-slate-400 mb-1">Start Message ID (Optional)</label>
+              <input type="number" id="min_msg_id" placeholder="e.g. 1" 
+                class="w-full bg-slate-950/80 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-sky-500 font-mono">
+            </div>
+            <div>
+              <label class="block text-[11px] font-medium text-slate-400 mb-1">End Message ID (Optional)</label>
+              <input type="number" id="max_msg_id" placeholder="e.g. 2300" 
+                class="w-full bg-slate-950/80 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-sky-500 font-mono">
+            </div>
+          </div>
+          <p class="text-[11px] text-slate-500 mt-1">Leave Message IDs blank to forward all messages.</p>
         </div>
 
         <!-- To Input -->
@@ -262,7 +291,7 @@ HTML_CONTENT = """<!DOCTYPE html>
           <label class="block text-xs font-semibold uppercase tracking-wider text-emerald-400 mb-1.5">To (Destination)</label>
           <input type="text" id="target" placeholder="e.g. https://t.me/targetchannel or @targetgroup/12" 
             class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3.5 py-2.5 text-sm focus:outline-none focus:border-emerald-500 font-mono">
-          <p class="text-[11px] text-slate-500 mt-1">Make sure you have posting/admin permissions.</p>
+          <p class="text-[11px] text-slate-500 mt-1">Make sure your account has admin/posting permissions.</p>
         </div>
 
         <!-- Clean Copy Toggle -->
@@ -306,6 +335,8 @@ HTML_CONTENT = """<!DOCTYPE html>
       const source = document.getElementById('source').value.trim();
       const target = document.getElementById('target').value.trim();
       const clean_copy = document.getElementById('clean_copy').checked;
+      const min_msg_id = document.getElementById('min_msg_id').value;
+      const max_msg_id = document.getElementById('max_msg_id').value;
 
       if (!source || !target) {
         alert("Please enter both source and destination links!");
@@ -316,7 +347,13 @@ HTML_CONTENT = """<!DOCTYPE html>
         const res = await fetch('/api/start', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ source, target, clean_copy })
+          body: JSON.stringify({ 
+            source, 
+            target, 
+            clean_copy,
+            min_msg_id: min_msg_id ? parseInt(min_msg_id) : null,
+            max_msg_id: max_msg_id ? parseInt(max_msg_id) : null
+          })
         });
         const data = await res.json();
         if (data.error) alert(data.error);
@@ -384,11 +421,13 @@ async def start_job(request: Request, background_tasks: BackgroundTasks):
     source = data.get("source")
     target = data.get("target")
     clean_copy = bool(data.get("clean_copy", True))
+    min_msg_id = data.get("min_msg_id")
+    max_msg_id = data.get("max_msg_id")
 
     if not source or not target:
         return JSONResponse({"error": "Source and Target links are required."}, status_code=400)
 
-    background_tasks.add_task(run_forward_task, source, target, clean_copy)
+    background_tasks.add_task(run_forward_task, source, target, clean_copy, min_msg_id, max_msg_id)
     return JSONResponse({"status": "Started successfully."})
 
 @app.post("/api/stop")
