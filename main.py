@@ -1,7 +1,7 @@
 import os
 import re
 import asyncio
-from typing import Optional
+from typing import Optional, Tuple
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse
 from telethon import TelegramClient
@@ -17,7 +17,7 @@ API_HASH = os.environ.get("API_HASH", "c3838a1772b0c67eadc6a46a8cfcf98a")
 raw_session = os.environ.get("SESSION_STRING", "")
 SESSION_STRING = raw_session.strip().strip('"').strip("'")
 
-app = FastAPI(title="Universal Telegram Forwarder")
+app = FastAPI(title="Telegram Smart Content Transfer")
 
 client: Optional[TelegramClient] = None
 
@@ -25,7 +25,6 @@ state = {
     "is_running": False,
     "current_status": "Idle",
     "total_processed": 0,
-    "last_message_id": 0,
     "logs": []
 }
 
@@ -35,53 +34,81 @@ def log(msg: str):
         state["logs"].pop(0)
     print(msg)
 
-def clean_chat_identifier(chat_input: str):
+def parse_telegram_input(chat_input: str) -> Tuple[object, Optional[int]]:
+    """
+    Parses any input string into (chat_identifier, topic_id).
+    Supports:
+      - @username/41 or https://t.me/username/41
+      - https://t.me/c/123456789/41
+      - https://t.me/+ABCDEF (Private invite)
+      - -100xxxxxxx or raw @username
+    """
     if not chat_input:
-        return ""
-    chat_input = chat_input.strip()
-    for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
-        if chat_input.startswith(prefix):
-            chat_input = chat_input[len(prefix):]
-    chat_input = chat_input.lstrip("@").rstrip("/")
-    if chat_input.lstrip("-").isdigit():
-        return int(chat_input)
-    return chat_input
-
-async def ensure_joined(chat_input: str):
-    """Automatically joins the channel/group if not already a member."""
-    if not chat_input:
-        return None
+        return "", None
 
     raw = str(chat_input).strip()
+    topic_id = None
 
-    # Case 1: Private invite link format (e.g., https://t.me/+ABCDEF or t.me/joinchat/ABCDEF)
-    invite_hash_match = re.search(r"(?:\+|joinchat/)([a-zA-Z0-9_-]+)", raw)
-    if invite_hash_match:
-        invite_hash = invite_hash_match.group(1)
+    # Check for private invite links (+ or joinchat/)
+    invite_match = re.search(r"(?:\+|joinchat/)([a-zA-Z0-9_-]+)", raw)
+    if invite_match:
+        return f"+{invite_match.group(1)}", None
+
+    # Remove standard t.me protocols
+    for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
+        if raw.startswith(prefix):
+            raw = raw[len(prefix):]
+            break
+
+    raw = raw.lstrip("@").rstrip("/")
+
+    # Check for topic link: c/123456789/41 or username/41
+    if "/" in raw:
+        parts = raw.split("/")
+        if len(parts) >= 2:
+            if parts[0] == "c":
+                # Private supergroup link format: c/<channel_id>/<topic_id>
+                chat_id_part = parts[1]
+                topic_part = parts[2] if len(parts) > 2 else parts[1]
+                if chat_id_part.isdigit():
+                    raw = int(f"-100{chat_id_part}")
+                if topic_part.isdigit():
+                    topic_id = int(topic_part)
+            else:
+                # Public topic link: <username>/<topic_id>
+                raw = parts[0]
+                if parts[1].isdigit():
+                    topic_id = int(parts[1])
+
+    # Convert numeric strings to int
+    if isinstance(raw, str) and raw.lstrip("-").isdigit():
+        raw = int(raw)
+
+    return raw, topic_id
+
+async def ensure_joined(identifier: object):
+    """Auto-joins channel/group if not already a member."""
+    # Handle private invites (+hash)
+    if isinstance(identifier, str) and identifier.startswith("+"):
+        invite_hash = identifier[1:]
         try:
-            log(f"Attempting to join private chat via invite hash: {invite_hash}")
+            log(f"Joining private chat via invite hash: {invite_hash}...")
             updates = await client(ImportChatInviteRequest(invite_hash))
-            log("Successfully joined private chat.")
             return updates.chats[0]
         except UserAlreadyParticipantError:
-            log("Already a participant of the private chat.")
+            pass
         except Exception as e:
-            log(f"Notice on joinchat: {e}")
+            log(f"Notice on joining private chat: {e}")
 
-    # Case 2: Public handle, username, or clean ID
-    cleaned = clean_chat_identifier(raw)
     try:
-        entity = await client.get_entity(cleaned)
-        return entity
+        return await client.get_entity(identifier)
     except Exception:
-        # If resolving entity fails because account is not in the channel
         try:
-            log(f"Not joined yet. Attempting to join public channel/group: {cleaned}")
-            await client(JoinChannelRequest(cleaned))
-            log(f"Successfully joined {cleaned}!")
-            return await client.get_entity(cleaned)
+            log(f"Joining public chat: {identifier}...")
+            await client(JoinChannelRequest(identifier))
+            return await client.get_entity(identifier)
         except Exception as e:
-            log(f"[Join Error] Could not join {cleaned}: {e}")
+            log(f"Auto-join failed for {identifier}: {e}")
             raise e
 
 def get_media_attributes(message):
@@ -100,9 +127,9 @@ async def startup_event():
             client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
             await client.connect()
             if await client.is_user_authorized():
-                log("[Auth] Successfully connected Telethon session.")
+                log("[Auth] Telethon user session connected.")
             else:
-                log("[Auth Error] Session string unauthorized or expired.")
+                log("[Auth Error] Session invalid or revoked.")
         except Exception as e:
             log(f"[Auth Error] {str(e)}")
 
@@ -150,54 +177,48 @@ async def forward_item(source, target, message, clean_copy: bool, target_topic: 
                 )
 
             state["total_processed"] += 1
-            state["last_message_id"] = message.id
             log(f"Transferred Message #{message.id} (Total: {state['total_processed']})")
             await asyncio.sleep(1.5)
             break
 
         except FloodWaitError as e:
             wait_sec = e.seconds + 5
-            log(f"[FloodWait] Telegram rate limited. Pausing for {wait_sec}s...")
+            log(f"[FloodWait] Telegram paused task for {wait_sec}s...")
             await asyncio.sleep(wait_sec)
         except Exception as e:
-            log(f"[Skip] Error copying Message #{message.id}: {str(e)}")
+            log(f"[Skip] Error copying message #{message.id}: {str(e)}")
             break
 
-async def run_forward_task(source_raw: str, target_raw: str, source_topic: Optional[int], target_topic: Optional[int], clean_copy: bool, filter_keyword: Optional[str]):
+async def run_forward_task(source_raw: str, target_raw: str, clean_copy: bool):
     global state, client
     state["is_running"] = True
     state["current_status"] = "Running"
     state["total_processed"] = 0
 
     try:
-        # Step 1: Ensure account is joined to source and target
-        log(f"Checking membership & resolving source: {source_raw}")
-        source = await ensure_joined(source_raw)
+        source_id, source_topic = parse_telegram_input(source_raw)
+        target_id, target_topic = parse_telegram_input(target_raw)
 
-        log(f"Checking membership & resolving target: {target_raw}")
-        target = await ensure_joined(target_raw)
+        log(f"Parsed Source: {source_id} (Topic: {source_topic or 'None'})")
+        log(f"Parsed Target: {target_id} (Topic: {target_topic or 'None'})")
 
-        log("Starting transfer of all content (videos, files, photos, texts, polls) chronologically...")
+        source = await ensure_joined(source_id)
+        target = await ensure_joined(target_id)
 
-        # reverse=True fetches from oldest to newest
+        log("Starting transfer in chronological order...")
+
+        # reverse=True ensures oldest to newest
         async for message in client.iter_messages(source, reverse=True, reply_to=source_topic if source_topic else None):
             if not state["is_running"]:
-                log("Process stopped by user.")
+                log("Stopped by user.")
                 break
 
             if message.action or (not message.message and not message.media):
                 continue
 
-            if filter_keyword:
-                text_content = (message.text or "")
-                if hasattr(message, "file") and message.file and message.file.name:
-                    text_content += " " + message.file.name
-                if filter_keyword.lower() not in text_content.lower():
-                    continue
-
             await forward_item(source, target, message, clean_copy, target_topic)
 
-        log(f"Finished! Successfully transferred {state['total_processed']} items.")
+        log(f"Done! Successfully transferred {state['total_processed']} items.")
     except Exception as e:
         log(f"[Fatal Task Error] {str(e)}")
     finally:
@@ -209,85 +230,72 @@ HTML_CONTENT = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Universal Telegram Content Forwarder</title>
+  <title>Telegram Forwarder</title>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
-<body class="bg-slate-950 text-slate-100 min-h-screen py-8 px-4 font-sans">
-  <div class="max-w-4xl mx-auto space-y-6">
+<body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col items-center justify-center p-4">
+  <div class="w-full max-w-xl space-y-4">
 
-    <div class="flex items-center justify-between border-b border-slate-800 pb-5">
-      <div>
-        <h1 class="text-2xl font-bold tracking-tight text-white">Universal Telegram Forwarder</h1>
-        <p class="text-sm text-slate-400">Auto-joins channels/groups and transfers all content cleanly in chronological order.</p>
-      </div>
-      <div id="statusBadge" class="px-3 py-1 text-xs font-semibold rounded-full bg-slate-800 text-slate-300">
-        Status: Idle
-      </div>
-    </div>
-
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-6 bg-slate-900 border border-slate-800 p-6 rounded-2xl shadow-xl">
-      <div class="space-y-4">
-        <h2 class="text-sm font-bold text-sky-400 uppercase tracking-wider">Source (Auto Joins If Needed)</h2>
+    <!-- Card -->
+    <div class="bg-slate-900 border border-slate-800 p-6 rounded-2xl shadow-2xl space-y-5">
+      <div class="flex items-center justify-between pb-3 border-b border-slate-800">
         <div>
-          <label class="block text-xs font-medium text-slate-300 mb-1">Source Chat / Link</label>
-          <input type="text" id="source" value="khaomaakasam" placeholder="username, link, or private invite (+xyz)" 
-            class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-sky-500">
+          <h1 class="text-xl font-bold text-white tracking-tight">Telegram Forwarder</h1>
+          <p class="text-xs text-slate-400">Paste any link, username, or topic URL</p>
         </div>
-        <div>
-          <label class="block text-xs font-medium text-slate-300 mb-1">Source Topic ID (Optional)</label>
-          <input type="number" id="source_topic" placeholder="Leave blank if not a topic" 
-            class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-sky-500">
-        </div>
+        <span id="statusBadge" class="px-2.5 py-1 text-xs font-semibold rounded-full bg-slate-800 text-slate-300">
+          Idle
+        </span>
       </div>
 
       <div class="space-y-4">
-        <h2 class="text-sm font-bold text-emerald-400 uppercase tracking-wider">Destination</h2>
+        <!-- From Input -->
         <div>
-          <label class="block text-xs font-medium text-slate-300 mb-1">Target Chat / Link</label>
-          <input type="text" id="target" value="dkdkslodd" placeholder="username or link" 
-            class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+          <label class="block text-xs font-semibold uppercase tracking-wider text-sky-400 mb-1.5">From (Source)</label>
+          <input type="text" id="source" placeholder="e.g. https://t.me/mygroup/41 or @channel" 
+            class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3.5 py-2.5 text-sm focus:outline-none focus:border-sky-500 font-mono">
+          <p class="text-[11px] text-slate-500 mt-1">Accepts channel link, invite link, or topic link (e.g. <code>@group/41</code>).</p>
         </div>
-        <div>
-          <label class="block text-xs font-medium text-slate-300 mb-1">Target Topic ID (Optional)</label>
-          <input type="number" id="target_topic" placeholder="Leave empty for main chat" 
-            class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
-        </div>
-      </div>
 
-      <div class="md:col-span-2 pt-2 border-t border-slate-800 grid grid-cols-1 md:grid-cols-2 gap-4">
+        <!-- To Input -->
         <div>
-          <label class="block text-xs font-medium text-slate-300 mb-1">Keyword Filter (Optional)</label>
-          <input type="text" id="filter_keyword" placeholder="Leave blank to transfer everything" 
-            class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-sky-500">
+          <label class="block text-xs font-semibold uppercase tracking-wider text-emerald-400 mb-1.5">To (Destination)</label>
+          <input type="text" id="target" placeholder="e.g. https://t.me/targetchannel or @targetgroup/12" 
+            class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3.5 py-2.5 text-sm focus:outline-none focus:border-emerald-500 font-mono">
+          <p class="text-[11px] text-slate-500 mt-1">Make sure you have posting/admin permissions.</p>
         </div>
-        <div class="flex items-center pt-5">
+
+        <!-- Clean Copy Toggle -->
+        <div class="flex items-center pt-1">
           <label class="relative flex items-center cursor-pointer select-none">
             <input type="checkbox" id="clean_copy" checked class="sr-only peer">
-            <div class="w-10 h-6 bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-sky-500"></div>
-            <span class="ml-3 text-sm font-medium text-slate-300">Clean copy (No "Forwarded from" tag)</span>
+            <div class="w-9 h-5 bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-sky-500"></div>
+            <span class="ml-3 text-xs text-slate-300">Clean copy (Hide "Forwarded from" tag)</span>
           </label>
         </div>
       </div>
 
-      <div class="md:col-span-2 flex items-center justify-end space-x-3 pt-2">
-        <button id="stopBtn" onclick="stopJob()" disabled 
-          class="px-5 py-2.5 rounded-lg text-sm font-semibold bg-rose-600/20 text-rose-300 border border-rose-500/30 hover:bg-rose-600/30 disabled:opacity-40 disabled:cursor-not-allowed">
-          Stop Process
-        </button>
+      <!-- Action Buttons -->
+      <div class="flex items-center space-x-3 pt-2">
         <button id="startBtn" onclick="startJob()" 
-          class="px-6 py-2.5 rounded-lg text-sm font-semibold bg-sky-500 hover:bg-sky-400 text-slate-950 font-bold transition disabled:opacity-40 disabled:cursor-not-allowed">
-          Start Forwarding All Content
+          class="flex-1 py-2.5 rounded-xl text-sm font-bold bg-sky-500 hover:bg-sky-400 text-slate-950 transition disabled:opacity-40">
+          Start Forwarding
+        </button>
+        <button id="stopBtn" onclick="stopJob()" disabled 
+          class="px-5 py-2.5 rounded-xl text-sm font-semibold bg-rose-600/20 text-rose-300 border border-rose-500/30 hover:bg-rose-600/30 transition disabled:opacity-40">
+          Stop
         </button>
       </div>
     </div>
 
-    <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
-      <div class="flex items-center justify-between">
-        <h3 class="text-sm font-semibold text-slate-300">Live Execution Log</h3>
-        <span id="counter" class="text-xs font-mono text-sky-400 font-bold">Processed: 0 messages</span>
+    <!-- Live Logs -->
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4 shadow-xl space-y-2">
+      <div class="flex items-center justify-between text-xs text-slate-400">
+        <span class="font-semibold">Live Log</span>
+        <span id="counter" class="font-mono text-sky-400">Processed: 0</span>
       </div>
-      <div id="console" class="h-64 overflow-y-auto bg-slate-950 rounded-xl p-4 font-mono text-xs text-slate-300 space-y-1 border border-slate-800">
-        <div class="text-slate-600">Ready. Paste your channels and click start.</div>
+      <div id="console" class="h-44 overflow-y-auto bg-slate-950 rounded-xl p-3 font-mono text-xs text-slate-300 space-y-1 border border-slate-800">
+        <div class="text-slate-600">Ready. Paste links and click Start.</div>
       </div>
     </div>
 
@@ -295,20 +303,20 @@ HTML_CONTENT = """<!DOCTYPE html>
 
   <script>
     async function startJob() {
-      const payload = {
-        source: document.getElementById('source').value,
-        source_topic: document.getElementById('source_topic').value,
-        target: document.getElementById('target').value,
-        target_topic: document.getElementById('target_topic').value,
-        clean_copy: document.getElementById('clean_copy').checked,
-        filter_keyword: document.getElementById('filter_keyword').value
-      };
+      const source = document.getElementById('source').value.trim();
+      const target = document.getElementById('target').value.trim();
+      const clean_copy = document.getElementById('clean_copy').checked;
+
+      if (!source || !target) {
+        alert("Please enter both source and destination links!");
+        return;
+      }
 
       try {
         const res = await fetch('/api/start', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify(payload)
+          body: JSON.stringify({ source, target, clean_copy })
         });
         const data = await res.json();
         if (data.error) alert(data.error);
@@ -331,18 +339,18 @@ HTML_CONTENT = """<!DOCTYPE html>
         const stopBtn = document.getElementById('stopBtn');
 
         if (data.is_running) {
-          badge.className = "px-3 py-1 text-xs font-semibold rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30";
-          badge.innerText = "Status: Running";
+          badge.className = "px-2.5 py-1 text-xs font-semibold rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30";
+          badge.innerText = "Running";
           startBtn.disabled = true;
           stopBtn.disabled = false;
         } else {
-          badge.className = "px-3 py-1 text-xs font-semibold rounded-full bg-slate-800 text-slate-300";
-          badge.innerText = `Status: ${data.current_status}`;
+          badge.className = "px-2.5 py-1 text-xs font-semibold rounded-full bg-slate-800 text-slate-300";
+          badge.innerText = data.current_status;
           startBtn.disabled = false;
           stopBtn.disabled = true;
         }
 
-        document.getElementById('counter').innerText = `Processed: ${data.total_processed} messages`;
+        document.getElementById('counter').innerText = `Processed: ${data.total_processed}`;
 
         const consoleEl = document.getElementById('console');
         if (data.logs.length > 0) {
@@ -375,23 +383,12 @@ async def start_job(request: Request, background_tasks: BackgroundTasks):
 
     source = data.get("source")
     target = data.get("target")
-    source_topic = int(data["source_topic"]) if data.get("source_topic") else None
-    target_topic = int(data["target_topic"]) if data.get("target_topic") else None
     clean_copy = bool(data.get("clean_copy", True))
-    filter_keyword = data.get("filter_keyword", "").strip() or None
 
     if not source or not target:
-        return JSONResponse({"error": "Source and Target are required."}, status_code=400)
+        return JSONResponse({"error": "Source and Target links are required."}, status_code=400)
 
-    background_tasks.add_task(
-        run_forward_task,
-        source,
-        target,
-        source_topic,
-        target_topic,
-        clean_copy,
-        filter_keyword
-    )
+    background_tasks.add_task(run_forward_task, source, target, clean_copy)
     return JSONResponse({"status": "Started successfully."})
 
 @app.post("/api/stop")
@@ -399,5 +396,5 @@ async def stop_job():
     if state["is_running"]:
         state["is_running"] = False
         log("Stop command sent...")
-        return JSONResponse({"status": "Stopping task..."})
+        return JSONResponse({"status": "Stopping..."})
     return JSONResponse({"status": "No active task."})
