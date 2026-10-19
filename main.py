@@ -1,12 +1,15 @@
 import os
+import re
 import asyncio
 from typing import Optional
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, UserAlreadyParticipantError
 from telethon.tl.types import MessageMediaDocument, MessageMediaPoll
+from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest
 
 API_ID = int(os.environ.get("API_ID", "36500123"))
 API_HASH = os.environ.get("API_HASH", "c3838a1772b0c67eadc6a46a8cfcf98a")
@@ -44,8 +47,44 @@ def clean_chat_identifier(chat_input: str):
         return int(chat_input)
     return chat_input
 
+async def ensure_joined(chat_input: str):
+    """Automatically joins the channel/group if not already a member."""
+    if not chat_input:
+        return None
+
+    raw = str(chat_input).strip()
+
+    # Case 1: Private invite link format (e.g., https://t.me/+ABCDEF or t.me/joinchat/ABCDEF)
+    invite_hash_match = re.search(r"(?:\+|joinchat/)([a-zA-Z0-9_-]+)", raw)
+    if invite_hash_match:
+        invite_hash = invite_hash_match.group(1)
+        try:
+            log(f"Attempting to join private chat via invite hash: {invite_hash}")
+            updates = await client(ImportChatInviteRequest(invite_hash))
+            log("Successfully joined private chat.")
+            return updates.chats[0]
+        except UserAlreadyParticipantError:
+            log("Already a participant of the private chat.")
+        except Exception as e:
+            log(f"Notice on joinchat: {e}")
+
+    # Case 2: Public handle, username, or clean ID
+    cleaned = clean_chat_identifier(raw)
+    try:
+        entity = await client.get_entity(cleaned)
+        return entity
+    except Exception:
+        # If resolving entity fails because account is not in the channel
+        try:
+            log(f"Not joined yet. Attempting to join public channel/group: {cleaned}")
+            await client(JoinChannelRequest(cleaned))
+            log(f"Successfully joined {cleaned}!")
+            return await client.get_entity(cleaned)
+        except Exception as e:
+            log(f"[Join Error] Could not join {cleaned}: {e}")
+            raise e
+
 def get_media_attributes(message):
-    """Preserves documents, filenames, audio tags, and video metadata."""
     if not message.media or not isinstance(message.media, MessageMediaDocument):
         return None
     document = message.media.document
@@ -74,20 +113,15 @@ async def shutdown_event():
         await client.disconnect()
 
 async def forward_item(source, target, message, clean_copy: bool, target_topic: Optional[int]):
-    """Sends any message type (photo, video, doc, poll, text) with or without forward tags."""
     while True:
         try:
             if clean_copy:
-                # 1. Handle Polls
                 if isinstance(message.media, MessageMediaPoll):
-                    poll = message.media.poll
-                    answers = [opt.text for opt in poll.answers]
                     await client.send_message(
                         entity=target,
                         file=message.media.poll,
                         reply_to=target_topic if target_topic else None
                     )
-                # 2. Handle Media (Videos, Photos, Audio, Voice Notes, Documents/Files)
                 elif message.media:
                     attrs = get_media_attributes(message)
                     await client.send_file(
@@ -99,7 +133,6 @@ async def forward_item(source, target, message, clean_copy: bool, target_topic: 
                         reply_to=target_topic if target_topic else None,
                         supports_streaming=True
                     )
-                # 3. Handle Plain or Formatted Text / Links
                 elif message.text:
                     await client.send_message(
                         entity=target,
@@ -109,7 +142,6 @@ async def forward_item(source, target, message, clean_copy: bool, target_topic: 
                         link_preview=bool(message.web_preview)
                     )
             else:
-                # Standard telegram forward (carries 'Forwarded from' tag)
                 await client.forward_messages(
                     entity=target,
                     messages=[message.id],
@@ -125,10 +157,10 @@ async def forward_item(source, target, message, clean_copy: bool, target_topic: 
 
         except FloodWaitError as e:
             wait_sec = e.seconds + 5
-            log(f"[FloodWait] Telegram rate limited. Sleeping for {wait_sec}s...")
+            log(f"[FloodWait] Telegram rate limited. Pausing for {wait_sec}s...")
             await asyncio.sleep(wait_sec)
         except Exception as e:
-            log(f"[Skip] Could not transfer Message #{message.id}: {str(e)}")
+            log(f"[Skip] Error copying Message #{message.id}: {str(e)}")
             break
 
 async def run_forward_task(source_raw: str, target_raw: str, source_topic: Optional[int], target_topic: Optional[int], clean_copy: bool, filter_keyword: Optional[str]):
@@ -138,30 +170,24 @@ async def run_forward_task(source_raw: str, target_raw: str, source_topic: Optio
     state["total_processed"] = 0
 
     try:
-        source_id = clean_chat_identifier(source_raw)
-        target_id = clean_chat_identifier(target_raw)
+        # Step 1: Ensure account is joined to source and target
+        log(f"Checking membership & resolving source: {source_raw}")
+        source = await ensure_joined(source_raw)
 
-        log(f"Resolving entities: Source -> {source_id} | Target -> {target_id}")
-        source = await client.get_entity(source_id)
-        target = await client.get_entity(target_id)
+        log(f"Checking membership & resolving target: {target_raw}")
+        target = await ensure_joined(target_raw)
 
-        log("Starting transfer of all content (videos, files, photos, texts, polls) in chronological order...")
+        log("Starting transfer of all content (videos, files, photos, texts, polls) chronologically...")
 
-        # reverse=True ensures oldest to newest order
+        # reverse=True fetches from oldest to newest
         async for message in client.iter_messages(source, reverse=True, reply_to=source_topic if source_topic else None):
             if not state["is_running"]:
                 log("Process stopped by user.")
                 break
 
-            # Skip service notifications (e.g. user joined, title changed)
-            if message.action:
+            if message.action or (not message.message and not message.media):
                 continue
 
-            # Must contain text, caption, or media
-            if not message.message and not message.media:
-                continue
-
-            # Optional search keyword filter
             if filter_keyword:
                 text_content = (message.text or "")
                 if hasattr(message, "file") and message.file and message.file.name:
@@ -171,14 +197,13 @@ async def run_forward_task(source_raw: str, target_raw: str, source_topic: Optio
 
             await forward_item(source, target, message, clean_copy, target_topic)
 
-        log(f"Finished! Successfully transferred all {state['total_processed']} items.")
+        log(f"Finished! Successfully transferred {state['total_processed']} items.")
     except Exception as e:
         log(f"[Fatal Task Error] {str(e)}")
     finally:
         state["is_running"] = False
         state["current_status"] = "Finished / Idle"
 
-# Embedded Dashboard UI
 HTML_CONTENT = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -193,7 +218,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     <div class="flex items-center justify-between border-b border-slate-800 pb-5">
       <div>
         <h1 class="text-2xl font-bold tracking-tight text-white">Universal Telegram Forwarder</h1>
-        <p class="text-sm text-slate-400">Transfer all messages, videos, documents, photos, and polls chronologically.</p>
+        <p class="text-sm text-slate-400">Auto-joins channels/groups and transfers all content cleanly in chronological order.</p>
       </div>
       <div id="statusBadge" class="px-3 py-1 text-xs font-semibold rounded-full bg-slate-800 text-slate-300">
         Status: Idle
@@ -202,24 +227,24 @@ HTML_CONTENT = """<!DOCTYPE html>
 
     <div class="grid grid-cols-1 md:grid-cols-2 gap-6 bg-slate-900 border border-slate-800 p-6 rounded-2xl shadow-xl">
       <div class="space-y-4">
-        <h2 class="text-sm font-bold text-sky-400 uppercase tracking-wider">Source (Channel / Group / Topic)</h2>
+        <h2 class="text-sm font-bold text-sky-400 uppercase tracking-wider">Source (Auto Joins If Needed)</h2>
         <div>
-          <label class="block text-xs font-medium text-slate-300 mb-1">Source Chat</label>
-          <input type="text" id="source" value="khaomaakasam" 
+          <label class="block text-xs font-medium text-slate-300 mb-1">Source Chat / Link</label>
+          <input type="text" id="source" value="khaomaakasam" placeholder="username, link, or private invite (+xyz)" 
             class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-sky-500">
         </div>
         <div>
           <label class="block text-xs font-medium text-slate-300 mb-1">Source Topic ID (Optional)</label>
-          <input type="number" id="source_topic" placeholder="Leave empty if regular channel or group" 
+          <input type="number" id="source_topic" placeholder="Leave blank if not a topic" 
             class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-sky-500">
         </div>
       </div>
 
       <div class="space-y-4">
-        <h2 class="text-sm font-bold text-emerald-400 uppercase tracking-wider">Destination (Channel / Group / Topic)</h2>
+        <h2 class="text-sm font-bold text-emerald-400 uppercase tracking-wider">Destination</h2>
         <div>
-          <label class="block text-xs font-medium text-slate-300 mb-1">Target Chat</label>
-          <input type="text" id="target" value="dkdkslodd" 
+          <label class="block text-xs font-medium text-slate-300 mb-1">Target Chat / Link</label>
+          <input type="text" id="target" value="dkdkslodd" placeholder="username or link" 
             class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
         </div>
         <div>
@@ -231,15 +256,15 @@ HTML_CONTENT = """<!DOCTYPE html>
 
       <div class="md:col-span-2 pt-2 border-t border-slate-800 grid grid-cols-1 md:grid-cols-2 gap-4">
         <div>
-          <label class="block text-xs font-medium text-slate-300 mb-1">Keyword Filter (Leave empty to copy everything)</label>
-          <input type="text" id="filter_keyword" placeholder="e.g. Notes or leave blank" 
+          <label class="block text-xs font-medium text-slate-300 mb-1">Keyword Filter (Optional)</label>
+          <input type="text" id="filter_keyword" placeholder="Leave blank to transfer everything" 
             class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-sky-500">
         </div>
         <div class="flex items-center pt-5">
           <label class="relative flex items-center cursor-pointer select-none">
             <input type="checkbox" id="clean_copy" checked class="sr-only peer">
             <div class="w-10 h-6 bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-sky-500"></div>
-            <span class="ml-3 text-sm font-medium text-slate-300">Clean copy (Hide "Forwarded from" tag)</span>
+            <span class="ml-3 text-sm font-medium text-slate-300">Clean copy (No "Forwarded from" tag)</span>
           </label>
         </div>
       </div>
@@ -262,7 +287,7 @@ HTML_CONTENT = """<!DOCTYPE html>
         <span id="counter" class="text-xs font-mono text-sky-400 font-bold">Processed: 0 messages</span>
       </div>
       <div id="console" class="h-64 overflow-y-auto bg-slate-950 rounded-xl p-4 font-mono text-xs text-slate-300 space-y-1 border border-slate-800">
-        <div class="text-slate-600">Ready. Fill fields and click start.</div>
+        <div class="text-slate-600">Ready. Paste your channels and click start.</div>
       </div>
     </div>
 
