@@ -1,110 +1,203 @@
 import os
 import asyncio
+from typing import Optional
+from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.templating import Jinja2Templates
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError
+from telethon.tl.types import MessageMediaDocument
 
-# ----------------- CONFIGURATION -----------------
 API_ID = int(os.environ.get("API_ID", "36500123"))
 API_HASH = os.environ.get("API_HASH", "c3838a1772b0c67eadc6a46a8cfcf98a")
-
-# Sanitize session string: strip any surrounding quotes, newlines, or whitespace
 raw_session = os.environ.get("SESSION_STRING", "")
 SESSION_STRING = raw_session.strip().strip('"').strip("'")
 
-SOURCE_CHAT = os.environ.get("SOURCE_CHAT", "khaomaakasam")
-TARGET_CHAT = os.environ.get("TARGET_CHAT", "dkdkslodd")
+app = FastAPI(title="Telegram Lecture Forwarder")
+templates = Jinja2Templates(directory="templates")
 
-PROGRESS_FILE = "last_forwarded_id.txt"
-COOLDOWN_DELAY = 1.5  # Safe delay (in seconds) between sends to prevent flood limits
-# --------------------------------------------------
+# Shared client instance (initialized on startup)
+client: Optional[TelegramClient] = None
 
-def clean_chat_identifier(chat_input):
-    """Normalize t.me URLs, @ handles, or numeric IDs."""
-    if isinstance(chat_input, str):
-        chat_input = chat_input.strip()
-        for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
-            if chat_input.startswith(prefix):
-                chat_input = chat_input[len(prefix):]
-        chat_input = chat_input.lstrip("@").rstrip("/")
-        if chat_input.lstrip("-").isdigit():
-            return int(chat_input)
+# Global state tracker for the web dashboard
+state = {
+    "is_running": False,
+    "current_status": "Idle",
+    "total_processed": 0,
+    "last_message_id": 0,
+    "logs": []
+}
+
+def log(msg: str):
+    state["logs"].append(msg)
+    if len(state["logs"]) > 100:
+        state["logs"].pop(0)
+    print(msg)
+
+def clean_chat_identifier(chat_input: str):
+    """Normalize t.me URLs, handles, or numeric IDs."""
+    if not chat_input:
+        return ""
+    chat_input = chat_input.strip()
+    for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
+        if chat_input.startswith(prefix):
+            chat_input = chat_input[len(prefix):]
+    chat_input = chat_input.lstrip("@").rstrip("/")
+    if chat_input.lstrip("-").isdigit():
+        return int(chat_input)
     return chat_input
 
-def get_last_processed_id():
-    """Retrieve last checkpoint message ID to resume if Railway restarts."""
-    if os.path.exists(PROGRESS_FILE):
-        try:
-            with open(PROGRESS_FILE, "r") as f:
-                content = f.read().strip()
-                if content.isdigit():
-                    return int(content)
-        except Exception as e:
-            print(f"Warning reading tracker file: {e}")
-    return 0
+def get_media_attributes(message):
+    if not message.media or not isinstance(message.media, MessageMediaDocument):
+        return None
+    document = message.media.document
+    if not document or not hasattr(document, "attributes"):
+        return None
+    return list(document.attributes)
 
-def save_last_processed_id(message_id):
-    """Save progress state to local file."""
-    with open(PROGRESS_FILE, "w") as f:
-        f.write(str(message_id))
+@app.on_event("startup")
+async def startup_event():
+    global client
+    if SESSION_STRING:
+        client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+        await client.connect()
+        if await client.is_user_authorized():
+            log("[Auth] Successfully connected Telethon user session.")
+        else:
+            log("[Auth Error] Session string unauthorized or expired.")
 
-async def send_clean_copy(client, target, message):
-    """Sends a copy of the message/media without any forward header."""
-    while True:
-        try:
-            if message.media:
-                # Reuses Telegram's cloud file directly without re-uploading
-                await client.send_file(
-                    entity=target,
-                    file=message.media,
-                    caption=message.text or "",
-                    formatting_entities=message.entities
-                )
-            elif message.text:
-                await client.send_message(
-                    entity=target,
-                    message=message.text,
-                    formatting_entities=message.entities,
-                    link_preview=bool(message.web_preview)
-                )
+@app.on_event("shutdown")
+async def shutdown_event():
+    global client
+    if client and client.is_connected():
+        await client.disconnect()
 
-            save_last_processed_id(message.id)
-            print(f"[COPIED] Message ID: {message.id}")
-            await asyncio.sleep(COOLDOWN_DELAY)
-            break
+async def run_forward_task(source_raw: str, target_raw: str, source_topic: Optional[int], target_topic: Optional[int], clean_copy: bool, filter_keyword: Optional[str]):
+    global state, client
+    state["is_running"] = True
+    state["current_status"] = "Running"
+    state["total_processed"] = 0
 
-        except FloodWaitError as e:
-            wait_time = e.seconds + 5
-            print(f"[FLOOD WAIT] Rate limit reached. Pausing execution for {wait_time}s...")
-            await asyncio.sleep(wait_time)
-        except Exception as e:
-            print(f"[SKIP] Could not copy message {message.id}: {e}")
-            save_last_processed_id(message.id)
-            break
+    try:
+        source_id = clean_chat_identifier(source_raw)
+        target_id = clean_chat_identifier(target_raw)
 
-async def main():
-    cleaned_source = clean_chat_identifier(SOURCE_CHAT)
-    cleaned_target = clean_chat_identifier(TARGET_CHAT)
+        log(f"Resolving source: {source_id} & target: {target_id}")
+        source = await client.get_entity(source_id)
+        target = await client.get_entity(target_id)
 
-    print("Connecting to user account using StringSession...")
-    async with TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH) as client:
-        print("Connected successfully.")
+        log("Starting chronological transfer...")
+        
+        # reverse=True fetches from oldest to newest
+        async for message in client.iter_messages(source, reverse=True, reply_to=source_topic if source_topic else None):
+            if not state["is_running"]:
+                log("Job manually stopped.")
+                break
 
-        source = await client.get_entity(cleaned_source)
-        target = await client.get_entity(cleaned_target)
+            # Skip empty service actions
+            if message.action or (not message.message and not message.media):
+                continue
 
-        last_id = get_last_processed_id()
-        print(f"Starting chronological forward (clean copy) from Message ID: {last_id}...")
+            # Optional keyword filter
+            if filter_keyword:
+                text_content = (message.text or "") + (message.file.name or "" if message.file else "")
+                if filter_keyword.lower() not in text_content.lower():
+                    continue
 
-        total_copied = 0
+            # Send/forward message
+            while True:
+                try:
+                    if clean_copy:
+                        # Direct copy without "Forwarded from" tag
+                        if message.media:
+                            attrs = get_media_attributes(message)
+                            await client.send_file(
+                                entity=target,
+                                file=message.media,
+                                caption=message.text or "",
+                                formatting_entities=message.entities,
+                                attributes=attrs,
+                                reply_to=target_topic if target_topic else None,
+                                supports_streaming=True
+                            )
+                        elif message.text:
+                            await client.send_message(
+                                entity=target,
+                                message=message.text,
+                                formatting_entities=message.entities,
+                                reply_to=target_topic if target_topic else None,
+                                link_preview=bool(message.web_preview)
+                            )
+                    else:
+                        # Forward preserving "Forwarded from" tag
+                        await client.forward_messages(
+                            entity=target,
+                            messages=[message.id],
+                            from_peer=source,
+                            reply_to=target_topic if target_topic else None
+                        )
 
-        # reverse=True traverses from oldest to newest (Lecture 1 -> 2300)
-        async for message in client.iter_messages(source, min_id=last_id, reverse=True):
-            if not message.action and (message.message or message.media):
-                await send_clean_copy(client, target, message)
-                total_copied += 1
+                    state["total_processed"] += 1
+                    state["last_message_id"] = message.id
+                    log(f"Transferred Message ID #{message.id} (Total: {state['total_processed']})")
+                    await asyncio.sleep(1.5)
+                    break
 
-        print(f"All done! Total messages forwarded cleanly: {total_copied}")
+                except FloodWaitError as e:
+                    wait_sec = e.seconds + 5
+                    log(f"[FloodWait] Telegram paused task for {wait_sec} seconds...")
+                    await asyncio.sleep(wait_sec)
+                except Exception as e:
+                    log(f"[Error] Failed Message #{message.id}: {str(e)}")
+                    break
 
-if __name__ == "__main__":
-    asyncio.run(main())
+        log(f"Task finished! Successfully transferred {state['total_processed']} items.")
+    except Exception as e:
+        log(f"[Fatal Task Error]: {str(e)}")
+    finally:
+        state["is_running"] = False
+        state["current_status"] = "Finished / Idle"
+
+@app.get("/", response_class=HTMLResponse)
+async def get_index(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
+@app.get("/api/status")
+async def get_status():
+    return JSONResponse(state)
+
+@app.post("/api/start")
+async def start_job(request: Request, background_tasks: BackgroundTasks):
+    data = await request.json()
+    if state["is_running"]:
+        return JSONResponse({"error": "A job is already running!"}, status_code=400)
+
+    source = data.get("source")
+    target = data.get("target")
+    source_topic = int(data["source_topic"]) if data.get("source_topic") else None
+    target_topic = int(data["target_topic"]) if data.get("target_topic") else None
+    clean_copy = bool(data.get("clean_copy", True))
+    filter_keyword = data.get("filter_keyword", "").strip() or None
+
+    if not source or not target:
+        return JSONResponse({"error": "Source and Target are required."}, status_code=400)
+
+    background_tasks.add_task(
+        run_forward_task,
+        source,
+        target,
+        source_topic,
+        target_topic,
+        clean_copy,
+        filter_keyword
+    )
+    return JSONResponse({"status": "Started successfully."})
+
+@app.post("/api/stop")
+async def stop_job():
+    if state["is_running"]:
+        state["is_running"] = False
+        log("Stop command sent...")
+        return JSONResponse({"status": "Stopping task..."})
+    return JSONResponse({"status": "No active task."})
