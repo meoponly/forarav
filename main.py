@@ -6,10 +6,22 @@ from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError, UserAlreadyParticipantError
-from telethon.tl.types import MessageMediaDocument, MessageMediaPoll
+from telethon.errors import (
+    FloodWaitError,
+    UserAlreadyParticipantError,
+    InviteHashExpiredError,
+    InviteHashInvalidError
+)
+from telethon.tl.types import (
+    MessageMediaDocument,
+    MessageMediaPoll,
+    ChatInviteAlready,
+    ChatInvite,
+    Updates,
+    UpdatesCombined
+)
 from telethon.tl.functions.channels import JoinChannelRequest
-from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
 
 API_ID = int(os.environ.get("API_ID", "36500123"))
 API_HASH = os.environ.get("API_HASH", "c3838a1772b0c67eadc6a46a8cfcf98a")
@@ -36,12 +48,11 @@ def log(msg: str):
 
 def parse_telegram_input(chat_input: str) -> Tuple[object, Optional[int]]:
     """
-    Parses any input string into (chat_identifier, topic_id).
-    Supports:
-      - @username/41 or https://t.me/username/41
-      - https://t.me/c/123456789/41
-      - https://t.me/+ABCDEF (Private invite)
-      - -100xxxxxxx or raw @username
+    Parses any input:
+      - Private invite link: https://t.me/+76FBRC9V4aA2N2J1 or t.me/joinchat/...
+      - Internal private link: https://t.me/c/123456789/41
+      - Public username: https://t.me/jajshdhg/15 or @jajshdhg/15
+      - Raw IDs: -100xxxxxx
     """
     if not chat_input:
         return "", None
@@ -49,12 +60,17 @@ def parse_telegram_input(chat_input: str) -> Tuple[object, Optional[int]]:
     raw = str(chat_input).strip()
     topic_id = None
 
-    # Check for private invite links (+ or joinchat/)
+    # 1. Private invite link: (+ or joinchat/)
     invite_match = re.search(r"(?:\+|joinchat/)([a-zA-Z0-9_-]+)", raw)
     if invite_match:
-        return f"+{invite_match.group(1)}", None
+        # Check if a topic was appended like +hash/15
+        after_hash = raw.split(invite_match.group(1))[-1]
+        topic_match = re.search(r"/(\d+)", after_hash)
+        if topic_match:
+            topic_id = int(topic_match.group(1))
+        return f"+{invite_match.group(1)}", topic_id
 
-    # Remove standard t.me protocols
+    # Strip prefixes
     for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
         if raw.startswith(prefix):
             raw = raw[len(prefix):]
@@ -62,50 +78,104 @@ def parse_telegram_input(chat_input: str) -> Tuple[object, Optional[int]]:
 
     raw = raw.lstrip("@").rstrip("/")
 
-    # Check for topic link: c/123456789/41 or username/41
-    if "/" in raw:
+    # 2. Private direct message/topic link: c/<channel_id>/<msg_or_topic_id>
+    if raw.startswith("c/"):
         parts = raw.split("/")
         if len(parts) >= 2:
-            if parts[0] == "c":
-                chat_id_part = parts[1]
-                topic_part = parts[2] if len(parts) > 2 else parts[1]
-                if chat_id_part.isdigit():
-                    raw = int(f"-100{chat_id_part}")
-                if topic_part.isdigit():
-                    topic_id = int(topic_part)
-            else:
-                raw = parts[0]
-                if parts[1].isdigit():
-                    topic_id = int(parts[1])
+            clean_digits = parts[1]
+            if clean_digits.isdigit():
+                raw = int(f"-100{clean_digits}")
+            if len(parts) >= 3 and parts[2].isdigit():
+                topic_id = int(parts[2])
+        return raw, topic_id
 
-    # Convert numeric strings to int
+    # 3. Public handle with topic: username/15
+    if "/" in raw:
+        parts = raw.split("/")
+        raw = parts[0]
+        if len(parts) >= 2 and parts[1].isdigit():
+            topic_id = int(parts[1])
+
+    # 4. Pure numeric ID
     if isinstance(raw, str) and raw.lstrip("-").isdigit():
         raw = int(raw)
 
     return raw, topic_id
 
-async def ensure_joined(identifier: object):
-    """Auto-joins channel/group if not already a member."""
+async def resolve_entity_safely(identifier: object):
+    """Accurately resolves public handles, private invite hashes, and numeric IDs."""
+    
+    # CASE 1: Private Invite Link (+hash)
     if isinstance(identifier, str) and identifier.startswith("+"):
         invite_hash = identifier[1:]
+        log(f"Resolving private invite hash: {invite_hash}...")
+        
+        # Step A: Check the invite first (safest way, won't error if already joined)
         try:
-            log(f"Joining private chat via invite hash: {invite_hash}...")
-            updates = await client(ImportChatInviteRequest(invite_hash))
-            return updates.chats[0]
-        except UserAlreadyParticipantError:
-            pass
-        except Exception as e:
-            log(f"Notice on joining private chat: {e}")
+            check_res = await client(CheckChatInviteRequest(invite_hash))
+            
+            # If already a participant, Telegram returns ChatInviteAlready containing the chat
+            if isinstance(check_res, ChatInviteAlready):
+                log(f"Already a member of private chat: '{check_res.chat.title}'")
+                return check_res.chat
 
+            # If not yet joined, import the invite to join
+            if isinstance(check_res, ChatInvite):
+                log(f"Joining private chat '{check_res.title}' via invite...")
+                imported = await client(ImportChatInviteRequest(invite_hash))
+                if hasattr(imported, 'chats') and imported.chats:
+                    return imported.chats[0]
+        except UserAlreadyParticipantError:
+            log("Already a participant of this private chat.")
+        except (InviteHashExpiredError, InviteHashInvalidError) as e:
+            log(f"[Error] The invite link has expired or is invalid: {e}")
+            raise e
+        except Exception as e:
+            log(f"Notice during invite inspection: {e}")
+
+        # Step B: Fallback - Scan active dialogs to find the chat entity
+        log("Searching loaded dialogs for private chat entity...")
+        async for dialog in client.iter_dialogs(limit=250):
+            # Dialogs populate Telethon's internal entity cache
+            pass
+
+        # Try importing directly if not already caught
+        try:
+            imported = await client(ImportChatInviteRequest(invite_hash))
+            if hasattr(imported, 'chats') and imported.chats:
+                return imported.chats[0]
+        except UserAlreadyParticipantError:
+            # Re-check dialogs after cache sync
+            async for dialog in client.iter_dialogs(limit=100):
+                if dialog.is_channel or dialog.is_group:
+                    return dialog.entity
+        except Exception as e:
+            log(f"Direct import note: {e}")
+
+        raise ValueError(f"Could not resolve private invite link: +{invite_hash}. Please make sure your account is in the chat or the link is active.")
+
+    # CASE 2: Numeric IDs (-100xxxx or int)
+    if isinstance(identifier, int):
+        try:
+            return await client.get_entity(identifier)
+        except Exception:
+            # Sync dialog cache first
+            log(f"Syncing dialogs to find ID: {identifier}...")
+            async for dialog in client.iter_dialogs(limit=250):
+                if dialog.id == identifier:
+                    return dialog.entity
+            return await client.get_entity(identifier)
+
+    # CASE 3: Public Username / Handle
     try:
         return await client.get_entity(identifier)
     except Exception:
+        log(f"Attempting to join public channel: {identifier}...")
         try:
-            log(f"Joining public chat: {identifier}...")
             await client(JoinChannelRequest(identifier))
             return await client.get_entity(identifier)
         except Exception as e:
-            log(f"Auto-join failed for {identifier}: {e}")
+            log(f"Could not resolve entity '{identifier}': {e}")
             raise e
 
 def get_media_attributes(message):
@@ -196,15 +266,13 @@ async def run_forward_task(source_raw: str, target_raw: str, clean_copy: bool, m
         source_id, source_topic = parse_telegram_input(source_raw)
         target_id, target_topic = parse_telegram_input(target_raw)
 
-        log(f"Parsed Source: {source_id} (Topic: {source_topic or 'None'})")
-        log(f"Parsed Target: {target_id} (Topic: {target_topic or 'None'})")
+        log(f"Source Identifier: {source_id} (Topic: {source_topic or 'None'})")
+        log(f"Target Identifier: {target_id} (Topic: {target_topic or 'None'})")
 
-        source = await ensure_joined(source_id)
-        target = await ensure_joined(target_id)
+        source = await resolve_entity_safely(source_id)
+        target = await resolve_entity_safely(target_id)
 
-        # Telethon min_id is exclusive (min_id=X fetches > X). Subtract 1 if provided to include X.
         actual_min_id = (min_msg_id - 1) if (min_msg_id and min_msg_id > 0) else None
-        # Telethon max_id is exclusive (max_id=Y fetches < Y). Add 1 if provided to include Y.
         actual_max_id = (max_msg_id + 1) if max_msg_id else None
 
         range_desc = []
@@ -216,7 +284,6 @@ async def run_forward_task(source_raw: str, target_raw: str, clean_copy: bool, m
 
         log(f"Starting chronological transfer{range_str}...")
 
-        # reverse=True ensures oldest to newest
         async for message in client.iter_messages(
             source, 
             reverse=True, 
@@ -251,12 +318,11 @@ HTML_CONTENT = """<!DOCTYPE html>
 <body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col items-center justify-center p-4">
   <div class="w-full max-w-xl space-y-4">
 
-    <!-- Card -->
     <div class="bg-slate-900 border border-slate-800 p-6 rounded-2xl shadow-2xl space-y-5">
       <div class="flex items-center justify-between pb-3 border-b border-slate-800">
         <div>
           <h1 class="text-xl font-bold text-white tracking-tight">Telegram Forwarder</h1>
-          <p class="text-xs text-slate-400">Paste any link, username, or topic URL</p>
+          <p class="text-xs text-slate-400">Supports Public, Private (+links), and Private Topics</p>
         </div>
         <span id="statusBadge" class="px-2.5 py-1 text-xs font-semibold rounded-full bg-slate-800 text-slate-300">
           Idle
@@ -264,13 +330,11 @@ HTML_CONTENT = """<!DOCTYPE html>
       </div>
 
       <div class="space-y-4">
-        <!-- From Input -->
         <div>
           <label class="block text-xs font-semibold uppercase tracking-wider text-sky-400 mb-1.5">From (Source)</label>
-          <input type="text" id="source" placeholder="e.g. https://t.me/mygroup/41 or @channel" 
+          <input type="text" id="source" placeholder="e.g. https://t.me/+76FBRC9V4aA2N2J1 or https://t.me/c/123456789/41" 
             class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3.5 py-2.5 text-sm focus:outline-none focus:border-sky-500 font-mono">
           
-          <!-- Optional Message Range (From / To) -->
           <div class="grid grid-cols-2 gap-3 mt-2.5">
             <div>
               <label class="block text-[11px] font-medium text-slate-400 mb-1">Start Message ID (Optional)</label>
@@ -283,18 +347,16 @@ HTML_CONTENT = """<!DOCTYPE html>
                 class="w-full bg-slate-950/80 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-sky-500 font-mono">
             </div>
           </div>
-          <p class="text-[11px] text-slate-500 mt-1">Leave Message IDs blank to forward all messages.</p>
+          <p class="text-[11px] text-slate-500 mt-1">Accepts private links (<code>t.me/+...</code>), internal links (<code>t.me/c/...</code>), or public handles.</p>
         </div>
 
-        <!-- To Input -->
         <div>
           <label class="block text-xs font-semibold uppercase tracking-wider text-emerald-400 mb-1.5">To (Destination)</label>
-          <input type="text" id="target" placeholder="e.g. https://t.me/targetchannel or @targetgroup/12" 
+          <input type="text" id="target" placeholder="e.g. https://t.me/jajshdhg/15 or -100xxxxxxxxxx" 
             class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3.5 py-2.5 text-sm focus:outline-none focus:border-emerald-500 font-mono">
-          <p class="text-[11px] text-slate-500 mt-1">Make sure your account has admin/posting permissions.</p>
+          <p class="text-[11px] text-slate-500 mt-1">Make sure you have posting permissions in destination.</p>
         </div>
 
-        <!-- Clean Copy Toggle -->
         <div class="flex items-center pt-1">
           <label class="relative flex items-center cursor-pointer select-none">
             <input type="checkbox" id="clean_copy" checked class="sr-only peer">
@@ -304,7 +366,6 @@ HTML_CONTENT = """<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- Action Buttons -->
       <div class="flex items-center space-x-3 pt-2">
         <button id="startBtn" onclick="startJob()" 
           class="flex-1 py-2.5 rounded-xl text-sm font-bold bg-sky-500 hover:bg-sky-400 text-slate-950 transition disabled:opacity-40">
@@ -317,7 +378,6 @@ HTML_CONTENT = """<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- Live Logs -->
     <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4 shadow-xl space-y-2">
       <div class="flex items-center justify-between text-xs text-slate-400">
         <span class="font-semibold">Live Log</span>
