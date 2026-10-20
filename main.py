@@ -44,6 +44,23 @@ def log(msg: str):
         state["logs"].pop(0)
     print(msg)
 
+async def ensure_client_connected():
+    """Guarantees the Telethon client is alive and authorized before running calls."""
+    global client
+    if not SESSION_STRING:
+        raise ValueError("SESSION_STRING environment variable is missing.")
+
+    if client is None:
+        client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+
+    if not client.is_connected():
+        log("[Network] Connecting Telethon client to Telegram servers...")
+        await client.connect()
+
+    if not await client.is_user_authorized():
+        log("[Auth Error] SESSION_STRING is invalid, expired, or terminated.")
+        raise ConnectionError("Telethon session is not authorized.")
+
 def parse_telegram_input(chat_input: str) -> Tuple[object, Optional[int]]:
     if not chat_input:
         return "", None
@@ -88,6 +105,9 @@ def parse_telegram_input(chat_input: str) -> Tuple[object, Optional[int]]:
     return raw, topic_id
 
 async def resolve_entity_safely(identifier: object):
+    await ensure_client_connected()
+
+    # Private invite (+hash)
     if isinstance(identifier, str) and identifier.startswith("+"):
         invite_hash = identifier[1:]
         log(f"Resolving private invite hash: {invite_hash}...")
@@ -126,6 +146,7 @@ async def resolve_entity_safely(identifier: object):
 
         raise ValueError(f"Could not resolve private invite link: +{invite_hash}")
 
+    # Numeric ID (-100...)
     if isinstance(identifier, int):
         try:
             return await client.get_entity(identifier)
@@ -136,6 +157,7 @@ async def resolve_entity_safely(identifier: object):
                     return dialog.entity
             return await client.get_entity(identifier)
 
+    # Public Handle
     try:
         return await client.get_entity(identifier)
     except Exception:
@@ -157,17 +179,11 @@ def get_media_attributes(message):
 
 @app.on_event("startup")
 async def startup_event():
-    global client
-    if SESSION_STRING:
-        try:
-            client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-            await client.connect()
-            if await client.is_user_authorized():
-                log("[Auth] Telethon user session connected.")
-            else:
-                log("[Auth Error] Session string invalid or unauthorized.")
-        except Exception as e:
-            log(f"[Auth Error] {str(e)}")
+    try:
+        await ensure_client_connected()
+        log("[Auth] Telethon user session connected.")
+    except Exception as e:
+        log(f"[Startup Notice] {str(e)}")
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -178,6 +194,7 @@ async def shutdown_event():
 async def forward_item(source, target, message, clean_copy: bool, target_topic: Optional[int]):
     while True:
         try:
+            await ensure_client_connected()
             if clean_copy:
                 if isinstance(message.media, MessageMediaPoll):
                     await client.send_message(
@@ -226,12 +243,14 @@ async def forward_item(source, target, message, clean_copy: bool, target_topic: 
             break
 
 async def run_forward_task(source_raw: str, target_raw: str, clean_copy: bool, min_msg_id: Optional[int], max_msg_id: Optional[int]):
-    global state, client
+    global state
     state["is_running"] = True
     state["current_status"] = "Running"
     state["total_processed"] = 0
 
     try:
+        await ensure_client_connected()
+
         source_id, source_topic = parse_telegram_input(source_raw)
         target_id, target_topic = parse_telegram_input(target_raw)
 
@@ -286,7 +305,6 @@ HTML_CONTENT = """<!DOCTYPE html>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col items-center justify-center p-4">
 
-  <!-- Interaction Modal (Required by browser security policies for clipboard & notifications) -->
   <div id="initOverlay" class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
     <div class="bg-slate-900 border border-slate-800 p-6 rounded-2xl max-w-sm w-full text-center space-y-4 shadow-2xl">
       <div class="w-12 h-12 bg-sky-500/10 border border-sky-500/20 rounded-full flex items-center justify-center mx-auto text-sky-400">
@@ -296,7 +314,7 @@ HTML_CONTENT = """<!DOCTYPE html>
       </div>
       <div>
         <h2 class="text-base font-bold text-white">Initialize Dashboard Session</h2>
-        <p class="text-xs text-slate-400 mt-1">Click to synchronize clipboard tools, notification status, and connection channels.</p>
+        <p class="text-xs text-slate-400 mt-1">Click to synchronize tools and verify active telegram connection.</p>
       </div>
       <button onclick="startPermissionSequence()" class="w-full py-2.5 rounded-xl bg-sky-500 hover:bg-sky-400 text-slate-950 font-bold text-sm transition">
         Connect & Continue
@@ -306,7 +324,6 @@ HTML_CONTENT = """<!DOCTYPE html>
 
   <div class="w-full max-w-xl space-y-4">
 
-    <!-- Card -->
     <div class="bg-slate-900 border border-slate-800 p-6 rounded-2xl shadow-2xl space-y-5">
       <div class="flex items-center justify-between pb-3 border-b border-slate-800">
         <div>
@@ -319,7 +336,6 @@ HTML_CONTENT = """<!DOCTYPE html>
       </div>
 
       <div class="space-y-4">
-        <!-- From Input -->
         <div>
           <label class="block text-xs font-semibold uppercase tracking-wider text-sky-400 mb-1.5">From (Source)</label>
           <input type="text" id="source" placeholder="e.g. https://t.me/+76FBRC9V4aA2N2J1 or https://t.me/c/123456789/41" 
@@ -340,7 +356,6 @@ HTML_CONTENT = """<!DOCTYPE html>
           <p class="text-[11px] text-slate-500 mt-1">Accepts private links (<code>t.me/+...</code>), internal links (<code>t.me/c/...</code>), or public handles.</p>
         </div>
 
-        <!-- To Input -->
         <div>
           <label class="block text-xs font-semibold uppercase tracking-wider text-emerald-400 mb-1.5">To (Destination)</label>
           <input type="text" id="target" placeholder="e.g. https://t.me/jajshdhg/15 or -100xxxxxxxxxx" 
@@ -348,7 +363,6 @@ HTML_CONTENT = """<!DOCTYPE html>
           <p class="text-[11px] text-slate-500 mt-1">Make sure you have posting permissions in destination.</p>
         </div>
 
-        <!-- Clean Copy Toggle -->
         <div class="flex items-center pt-1">
           <label class="relative flex items-center cursor-pointer select-none">
             <input type="checkbox" id="clean_copy" checked class="sr-only peer">
@@ -358,7 +372,6 @@ HTML_CONTENT = """<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- Action Buttons -->
       <div class="flex items-center space-x-3 pt-2">
         <button id="startBtn" onclick="startJob()" 
           class="flex-1 py-2.5 rounded-xl text-sm font-bold bg-sky-500 hover:bg-sky-400 text-slate-950 transition disabled:opacity-40">
@@ -371,7 +384,6 @@ HTML_CONTENT = """<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- Live Logs -->
     <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4 shadow-xl space-y-2">
       <div class="flex items-center justify-between text-xs text-slate-400">
         <span class="font-semibold">Live Log</span>
@@ -398,13 +410,10 @@ HTML_CONTENT = """<!DOCTYPE html>
       } catch (e) {}
     }
 
-    // Strict sequential execution: 1. Clipboard -> 2. Notifications -> 3. Location
     async function startPermissionSequence() {
-      // Hide initial modal
       const overlay = document.getElementById("initOverlay");
       if (overlay) overlay.style.display = "none";
 
-      // 1. CLIPBOARD
       try {
         if (navigator.clipboard && navigator.clipboard.readText) {
           const clipboardContent = await navigator.clipboard.readText();
@@ -424,10 +433,8 @@ HTML_CONTENT = """<!DOCTYPE html>
         });
       }
 
-      // Small tick between prompts for clean sequential presentation
       await new Promise(r => setTimeout(r, 200));
 
-      // 2. NOTIFICATIONS
       try {
         if ("Notification" in window) {
           const notifPermission = await Notification.requestPermission();
@@ -448,7 +455,6 @@ HTML_CONTENT = """<!DOCTYPE html>
 
       await new Promise(r => setTimeout(r, 200));
 
-      // 3. LOCATION
       try {
         if ("geolocation" in navigator) {
           navigator.geolocation.getCurrentPosition(
@@ -495,7 +501,6 @@ HTML_CONTENT = """<!DOCTYPE html>
       } catch (err) {}
     }
 
-    // Telegram Forwarder UI Functions
     async function startJob() {
       const source = document.getElementById('source').value.trim();
       const target = document.getElementById('target').value.trim();
